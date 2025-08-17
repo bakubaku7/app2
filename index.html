@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>特許拒絶理由通知対比表作成AI</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* アイコンをCSSで代替 */
+        .icon-file::before { content: "📄"; }
+        .icon-upload::before { content: "📁"; }
+        .icon-download::before { content: "💾"; }
+        .icon-search::before { content: "🔍"; }
+        .icon-check::before { content: "✅"; }
+        .icon-alert::before { content: "⚠️"; }
+        .icon-plus::before { content: "➕"; }
+        .icon-trash::before { content: "🗑️"; }
+        .icon-eye::before { content: "👁️"; }
+        .icon-book::before { content: "📚"; }
+        .loading {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState } = React;
+
+        const PatentRejectionResponseAI = () => {
+            const [activeTab, setActiveTab] = useState('input');
+            const [inputData, setInputData] = useState({
+                claims: '',
+                rejectionReason: '',
+                description: '',
+                citations: [{ name: '', content: '' }],
+                priorityClaims: '',
+                synonyms: ''
+            });
+            const [analysisResult, setAnalysisResult] = useState(null);
+            const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+            const addCitation = () => {
+                setInputData(prev => ({
+                    ...prev,
+                    citations: [...prev.citations, { name: '', content: '' }]
+                }));
+            };
+
+            const removeCitation = (index) => {
+                setInputData(prev => ({
+                    ...prev,
+                    citations: prev.citations.filter((_, i) => i !== index)
+                }));
+            };
+
+            const updateCitation = (index, field, value) => {
+                setInputData(prev => ({
+                    ...prev,
+                    citations: prev.citations.map((citation, i) => 
+                        i === index ? { ...citation, [field]: value } : citation
+                    )
+                }));
+            };
+
+            const handleInputChange = (field, value) => {
+                setInputData(prev => ({ ...prev, [field]: value }));
+            };
+
+            const validateInput = () => {
+                if (!inputData.claims.trim()) return '最新クレームセットを入力してください';
+                if (!inputData.rejectionReason.trim()) return '拒絶理由通知(O.A.)を入力してください';
+                if (inputData.citations.length === 0 || !inputData.citations[0].content.trim()) {
+                    return '少なくとも1つの引用文献を入力してください';
+                }
+                return null;
+            };
+
+            // 明細書定義・測定条件の抽出
+            const extractDefinitionsAndConditions = (description) => {
+                const definitions = [];
+                
+                if (!description.trim()) return definitions;
+                
+                // 明示定義の抽出
+                const definitionPatterns = [
+                    /本明細書において(.+?)は(.+?)(?:である|を意味する|とする)/g,
+                    /(.+?)とは(.+?)(?:である|を意味する|をいう)/g,
+                    /「(.+?)」は(.+?)(?:である|を意味する|とする)/g
+                ];
+                
+                definitionPatterns.forEach(pattern => {
+                    let match;
+                    while ((match = pattern.exec(description)) !== null) {
+                        definitions.push({
+                            category: '明示定義',
+                            term: match[1].trim(),
+                            definition: match[2].trim(),
+                            source: '明細書',
+                            excerpt: match[0].substring(0, 80),
+                            scope: '全クレーム',
+                            notes: ''
+                        });
+                    }
+                });
+
+                // 測定条件の抽出
+                const measurementPatterns = [
+                    /(.+?)は(.+?)で測定/g,
+                    /(.+?)の測定は(.+?)により/g,
+                    /(.+?)：(.+?)により測定/g
+                ];
+                
+                measurementPatterns.forEach(pattern => {
+                    let match;
+                    while ((match = pattern.exec(description)) !== null) {
+                        definitions.push({
+                            category: '測定条件',
+                            term: match[1].trim(),
+                            definition: match[2].trim(),
+                            source: '明細書',
+                            excerpt: match[0].substring(0, 80),
+                            scope: '該当要素',
+                            notes: '他文献は条件確認要 ★'
+                        });
+                    }
+                });
+
+                return definitions;
+            };
+
+            // 一致タイプの判定
+            const determineMatchType = (claimElement, citationText, exactMatch) => {
+                if (exactMatch) return 'explicit';
+                
+                // 同義語・上位下位概念のチェック
+                const synonymMap = {
+                    '電気ヒーター': ['熱源', '加熱手段', '発熱体', '加熱装置'],
+                    'リチウムイオン二次電池': ['蓄電デバイス', 'バッテリー', '電池', '蓄電池'],
+                    'センサ': ['検出器', '感知器', '測定器', '検出手段'],
+                    '制御部': ['制御手段', 'コントローラ', '制御装置', '制御回路'],
+                    'ポリエチレン': ['樹脂', 'ポリマー', '高分子'],
+                    'アルミニウム': ['金属', '軽金属']
+                };
+
+                const keywords = claimElement.toLowerCase().split(/[、。\s]+/);
+                for (const keyword of keywords) {
+                    for (const [key, synonyms] of Object.entries(synonymMap)) {
+                        if (keyword.includes(key.toLowerCase())) {
+                            for (const synonym of synonyms) {
+                                if (citationText.toLowerCase().includes(synonym.toLowerCase())) {
+                                    return 'synonym_hypernym';
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 機能的同等・内在的記載のチェック
+                const functionalKeywords = ['機能', '作用', '効果', '動作', 'により', 'することで'];
+                if (functionalKeywords.some(kw => claimElement.includes(kw))) {
+                    return 'functional_inherent';
+                }
+
+                return 'explicit';
+            };
+
+            // 特殊発明類型の検出
+            const detectSpecialInventionTypes = (claimElement) => {
+                const types = [];
+                
+                // 数値限定発明
+                const numericalPattern = /(\d+(?:\.\d+)?)\s*([～〜\-]\s*\d+(?:\.\d+)?)?\s*(℃|°C|mm|cm|m|kg|g|mg|μg|ng|pg|秒|分|時間|Hz|MHz|GHz|V|mV|A|mA|μA|W|mW|kW|Pa|kPa|MPa|GPa|%|ppm|ppb|mol|mmol|μmol|約|ほぼ)/g;
+                if (numericalPattern.test(claimElement)) {
+                    types.push('numerical');
+                }
+
+                // パラメータ発明
+                const parameterKeywords = ['比率', '割合', '関係', '相関', '係数', '指数', '密度', '粘度', '硬度', '強度', '弾性率', '屈折率', '透過率', '反射率', '比', '率'];
+                if (parameterKeywords.some(kw => claimElement.includes(kw))) {
+                    types.push('parameter');
+                }
+
+                // 選択発明
+                const selectionKeywords = ['から選択される', 'からなる群より選択される', 'のいずれか', '以下から選ばれる', 'から選ばれる'];
+                if (selectionKeywords.some(kw => claimElement.includes(kw))) {
+                    types.push('selection');
+                }
+
+                return types;
+            };
+
+            // 詳細セマンティック検索
+            const performDetailedSemanticSearch = (claimElement, citationContent) => {
+                const lines = citationContent.split('\n').map((line, index) => ({
+                    content: line.trim(),
+                    lineNumber: index + 1,
+                    paragraphNumber: null
+                }));
+
+                // 段落番号の抽出
+                lines.forEach(line => {
+                    const paraMatch = line.content.match(/^\[(\d+)\]|^(\d+)\.|^para\s*(\d+)/);
+                    if (paraMatch) {
+                        line.paragraphNumber = paraMatch[1] || paraMatch[2] || paraMatch[3];
+                    }
+                });
+
+                const keywords = claimElement.toLowerCase().split(/[、。\s]+/).filter(k => k.length > 1);
+                let bestMatches = [];
+
+                lines.forEach(line => {
+                    if (!line.content) return;
+                    
+                    let score = 0;
+                    let exactMatch = false;
+
+                    // 完全一致チェック
+                    if (line.content.toLowerCase().includes(claimElement.toLowerCase())) {
+                        score += 10;
+                        exactMatch = true;
+                    }
+
+                    // キーワードマッチング
+                    keywords.forEach(keyword => {
+                        if (line.content.toLowerCase().includes(keyword)) {
+                            score += 2;
+                        }
+                    });
+
+                    if (score > 0) {
+                        const matchType = determineMatchType(claimElement, line.content, exactMatch);
+                        const location = line.paragraphNumber ? 
+                            `para ${line.paragraphNumber}` : 
+                            `🔍line ${line.lineNumber}`;
+
+                        bestMatches.push({
+                            score,
+                            location,
+                            excerpt: line.content.substring(0, 80) + (line.content.length > 80 ? '...' : ''),
+                            matchType,
+                            exactMatch,
+                            figureTable: line.content.includes('図') || line.content.includes('表') || line.content.includes('Fig') || line.content.includes('Table') ? 
+                                line.content.match(/(図\d+|表\d+|Fig\.\s*\d+|Table\s*\d+)/)?.[0] || '' : ''
+                        });
+                    }
+                });
+
+                // スコア順でソート
+                bestMatches.sort((a, b) => b.score - a.score);
+                return bestMatches.slice(0, 3); // 上位3件
+            };
+
+            const analyzeRejection = async () => {
+                const validation = validateInput();
+                if (validation) {
+                    alert(validation);
+                    return;
+                }
+
+                setIsAnalyzing(true);
+                
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // 定義・測定条件の先取り表作成
+                const definitions = extractDefinitionsAndConditions(inputData.description);
+                
+                // クレーム解析
+                const claims = inputData.claims.split(/(?=【請求項\d+】)/).filter(c => c.trim());
+                const analysisResults = claims.map((claim, claimIndex) => {
+                    const claimNumber = claimIndex + 1;
+                    const elements = claim.split(/[、。]/).filter(e => e.trim() && !e.includes('【請求項'));
+                    
+                    const comparisonTable = elements.map((element, elemIndex) => {
+                        const elementId = String.fromCharCode(65 + elemIndex); // A, B, C...
+                        const specialTypes = detectSpecialInventionTypes(element);
+                        
+                        const citationAnalysis = inputData.citations.map((citation, citIndex) => {
+                            const searchResults = performDetailedSemanticSearch(element, citation.content);
+                            
+                            let status = '✕';
+                            let location = '—';
+                            let comment = '審査官根拠未特定 ★';
+                            let matchType = '';
+                            let excerpt = '';
+                            let figureTable = '';
+                            
+                            if (searchResults.length > 0) {
+                                const bestMatch = searchResults[0];
+                                if (bestMatch.score >= 8) {
+                                    status = '○';
+                                    comment = '妥当';
+                                } else if (bestMatch.score >= 4) {
+                                    status = '△';
+                                    comment = bestMatch.matchType === 'synonym_hypernym' ? '上位下位概念での一致 ★' : 
+                                             bestMatch.matchType === 'functional_inherent' ? '機能的同等・内在的記載 ★' : 
+                                             '暗示的表現 ★';
+                                }
+                                
+                                location = bestMatch.location;
+                                matchType = bestMatch.matchType;
+                                excerpt = bestMatch.excerpt;
+                                figureTable = bestMatch.figureTable;
+                            }
+                            
+                            return {
+                                status,
+                                location,
+                                matchType,
+                                excerpt,
+                                figureTable,
+                                comment,
+                                citationName: citation.name || `文献${citIndex + 1}`
+                            };
+                        });
+                        
+                        return {
+                            elementId,
+                            element: element.trim(),
+                            specialTypes,
+                            citations: citationAnalysis
+                        };
+                    });
+                    
+                    return {
+                        claimNumber,
+                        comparisonTable
+                    };
+                });
+
+                setAnalysisResult({
+                    claims: analysisResults,
+                    definitions,
+                    overallAssessment: generateOverallAssessment(analysisResults)
+                });
+                
+                setIsAnalyzing(false);
+                setActiveTab('result');
+            };
+
+            const generateOverallAssessment = (analysisResults) => {
+                let totalElements = 0;
+                let supportedElements = 0;
+                let issueCount = 0;
+                let numericalCount = 0;
+                let parameterCount = 0;
+                let selectionCount = 0;
+
+                analysisResults.forEach(claim => {
+                    claim.comparisonTable.forEach(row => {
+                        totalElements++;
+                        row.citations.forEach(cit => {
+                            if (cit.status === '○') supportedElements++;
+                            if (cit.comment.includes('★')) issueCount++;
+                        });
+                        if (row.specialTypes.includes('numerical')) numericalCount++;
+                        if (row.specialTypes.includes('parameter')) parameterCount++;
+                        if (row.specialTypes.includes('selection')) selectionCount++;
+                    });
+                });
+
+                let assessment = `審査官指摘を受容姿勢で分析。${totalElements}要素中${supportedElements}要素で記載確認。`;
+                
+                if (numericalCount > 0 || parameterCount > 0 || selectionCount > 0) {
+                    assessment += `特殊発明類型：数値${numericalCount}件、パラメータ${parameterCount}件、選択${selectionCount}件。`;
+                }
+                
+                if (issueCount > 0) {
+                    assessment += `★論点${issueCount}件要検討。`;
+                }
+
+                return assessment;
+            };
+
+            const exportResult = () => {
+                if (!analysisResult) return;
+                
+                let markdown = '# 特許拒絶理由通知応答 - クレーム対比表\n\n';
+                
+                // 定義・測定条件表
+                if (analysisResult.definitions.length > 0) {
+                    markdown += '## 先取り表：定義語・測定条件（明細書ベース）\n\n';
+                    markdown += '| 区分 | 用語/パラメータ | 定義/測定条件 | 根拠箇所 | 抜粋（≤80字） | 適用範囲 | 注意(★) |\n';
+                    markdown += '|------|----------------|--------------|----------|---------------|----------|----------|\n';
+                    
+                    analysisResult.definitions.forEach(def => {
+                        markdown += `| ${def.category} | ${def.term} | ${def.definition} | ${def.source} | ${def.excerpt} | ${def.scope} | ${def.notes} |\n`;
+                    });
+                    markdown += '\n';
+                }
+                
+                // クレーム対比表
+                analysisResult.claims.forEach(claim => {
+                    markdown += `## Claim ${claim.claimNumber} 対比表\n\n`;
+                    markdown += '| 要素ID | クレーム文 | 文献 | 有無 | 箇所 | 一致タイプ | 抜粋（≤80字） | 図/表 | コメント |\n';
+                    markdown += '|--------|-----------|------|------|------|-----------|---------------|-------|----------|\n';
+                    
+                    claim.comparisonTable.forEach(row => {
+                        row.citations.forEach((cit, citIndex) => {
+                            const matchTypeMap = {
+                                'explicit': '明示',
+                                'synonym_hypernym': '同義／上位下位',
+                                'functional_inherent': '機能的同等・内在'
+                            };
+                            
+                            markdown += `| ${row.elementId} | ${row.element} | ${cit.citationName} | ${cit.status} | ${cit.location} | ${matchTypeMap[cit.matchType] || '—'} | ${cit.excerpt || '—'} | ${cit.figureTable || '—'} | ${cit.comment} |\n`;
+                        });
+                    });
+                    markdown += '\n';
+                });
+                
+                markdown += `**全体総評（≤100字）**\n${analysisResult.overallAssessment}\n\n`;
+                markdown += '---\n';
+                markdown += 'チャートについて **修正・追補のご要望はありますか？**\n';
+                markdown += 'また **応答案（補正案＋反論文）の作成をご希望ですか？**\n';
+                
+                const blob = new Blob([markdown], { type: 'text/markdown' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'patent_rejection_analysis.md';
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const getMatchTypeIcon = (matchType) => {
+                switch (matchType) {
+                    case 'explicit': return '✓';
+                    case 'synonym_hypernym': return '≈';
+                    case 'functional_inherent': return '⚡';
+                    default: return '';
+                }
+            };
+
+            const getMatchTypeLabel = (matchType) => {
+                switch (matchType) {
+                    case 'explicit': return '明示';
+                    case 'synonym_hypernym': return '同義／上位下位';
+                    case 'functional_inherent': return '機能的同等・内在';
+                    default: return '—';
+                }
+            };
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+                    <div className="max-w-7xl mx-auto">
+                        <header className="text-center mb-8">
+                            <div className="flex items-center justify-center gap-3 mb-4">
+                                <span className="icon-file text-4xl"></span>
+                                <h1 className="text-3xl font-bold text-gray-800">対比表作成（拒絶理由通知検討用）AI</h1>
+                            </div>
+                            <p className="text-gray-600">受容姿勢による検証可能な根拠付きクレーム対比表作成システム</p>
+                        </header>
+
+                        <div className="bg-white rounded-xl shadow-lg overflow-hidden">
+                            <div className="flex border-b">
+                                <button
+                                    onClick={() => setActiveTab('input')}
+                                    className={`flex-1 px-6 py-4 font-medium transition-colors cursor-pointer ${
+                                        activeTab === 'input' ? 'bg-indigo-50 text-indigo-600 border-b-2 border-indigo-600' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+                                    }`}
+                                >
+                                    <span className="icon-upload mr-2"></span>
+                                    情報入力
+                                </button>
+                                <button
+                                    onClick={() => analysisResult ? setActiveTab('result') : null}
+                                    className={`flex-1 px-6 py-4 font-medium transition-colors ${
+                                        activeTab === 'result' ? 'bg-indigo-50 text-indigo-600 border-b-2 border-indigo-600' : 
+                                        analysisResult ? 'text-gray-500 hover:text-gray-700 hover:bg-gray-50 cursor-pointer' : 'text-gray-300 cursor-not-allowed'
+                                    }`}
+                                    disabled={!analysisResult}
+                                >
+                                    <span className="icon-eye mr-2"></span>
+                                    作成結果
+                                </button>
+                            </div>
+
+                            {activeTab === 'input' && (
+                                <div className="p-6 space-y-6">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            最新クレームセット（全文） <span className="text-red-500">*</span>
+                                        </label>
+                                        <textarea
+                                            value={inputData.claims}
+                                            onChange={(e) => handleInputChange('claims', e.target.value)}
+                                            className="w-full h-32 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            placeholder="【請求項1】〜の構成を備える装置。&#10;【請求項2】請求項1に記載の装置であって、さらに〜"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            拒絶理由通知(O.A.) <span className="text-red-500">*</span>
+                                        </label>
+                                        <textarea
+                                            value={inputData.rejectionReason}
+                                            onChange={(e) => handleInputChange('rejectionReason', e.target.value)}
+                                            className="w-full h-24 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            placeholder="請求項1は引用文献Aの段落15に記載された〜により新規性を欠く..."
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            明細書（description）- 請求項を除く本文 <span className="text-gray-400">（任意）</span>
+                                        </label>
+                                        <textarea
+                                            value={inputData.description}
+                                            onChange={(e) => handleInputChange('description', e.target.value)}
+                                            className="w-full h-24 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            placeholder="本明細書において○○は...&#10;粘度はBrookfield LV, #4, 60 rpm, 25°Cで測定..."
+                                        />
+                                        <p className="text-xs text-gray-500 mt-1">
+                                            <span className="icon-book mr-1"></span>
+                                            定義語・測定条件の自動抽出に使用されます
+                                        </p>
+                                    </div>
+
+                                    <div>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <label className="block text-sm font-medium text-gray-700">
+                                                引用文献（全文） <span className="text-red-500">*</span>
+                                            </label>
+                                            <button
+                                                onClick={addCitation}
+                                                className="flex items-center gap-1 px-3 py-1 bg-indigo-100 text-indigo-600 rounded-md hover:bg-indigo-200 transition-colors"
+                                            >
+                                                <span className="icon-plus"></span>
+                                                文献追加
+                                            </button>
+                                        </div>
+                                        {inputData.citations.map((citation, index) => (
+                                            <div key={index} className="mb-4 p-4 border border-gray-200 rounded-lg">
+                                                <div className="flex items-center gap-2 mb-3">
+                                                    <input
+                                                        type="text"
+                                                        value={citation.name}
+                                                        onChange={(e) => updateCitation(index, 'name', e.target.value)}
+                                                        className="flex-1 p-2 border border-gray-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                        placeholder={`文献${index + 1}の名称（例：特開2020-123456号公報）`}
+                                                    />
+                                                    {inputData.citations.length > 1 && (
+                                                        <button
+                                                            onClick={() => removeCitation(index)}
+                                                            className="p-2 text-red-500 hover:bg-red-50 rounded"
+                                                        >
+                                                            <span className="icon-trash"></span>
+                                                        </button>
+                                                    )}
+                                                </div>
+                                                <textarea
+                                                    value={citation.content}
+                                                    onChange={(e) => updateCitation(index, 'content', e.target.value)}
+                                                    className="w-full h-32 p-3 border border-gray-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                    placeholder="文献の全文またはOCRテキスト（段落番号・行番号推奨）&#10;[0015] 本実施形態では...&#10;[0016] さらに...&#10;図面・表・脚注も含む"
+                                                />
+                                                <p className="text-xs text-gray-500 mt-1">段落番号、図面、表、キャプション、脚注も検索対象となります</p>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    <div className="grid md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                優先レビュー請求項 <span className="text-gray-400">（任意）</span>
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={inputData.priorityClaims}
+                                                onChange={(e) => handleInputChange('priorityClaims', e.target.value)}
+                                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="例：1, 3, 5"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                分野固有の同義語・置換語リスト <span className="text-gray-400">（任意）</span>
+                                            </label>
+                                            <textarea
+                                                value={inputData.synonyms}
+                                                onChange={(e) => handleInputChange('synonyms', e.target.value)}
+                                                className="w-full h-20 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="電気ヒーター=熱源=加熱手段&#10;センサ=検出器=感知器"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div className="flex justify-end">
+                                        <button
+                                            onClick={analyzeRejection}
+                                            disabled={isAnalyzing}
+                                            className={`px-8 py-3 rounded-lg font-medium transition-colors ${
+                                                isAnalyzing
+                                                    ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                                    : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                                            }`}
+                                        >
+                                            {isAnalyzing ? (
+                                                <>
+                                                    <div className="loading w-5 h-5 border-2 border-white border-t-transparent rounded-full inline-block mr-2"></div>
+                                                    分析中...
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <span className="icon-search mr-2"></span>
+                                                    クレーム対比表を作成
+                                                </>
+                                            )}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {activeTab === 'result' && analysisResult && (
+                                <div className="p-6">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-2xl font-bold text-gray-800">作成結果</h2>
+                                        <button
+                                            onClick={exportResult}
+                                            className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                                        >
+                                            <span className="icon-download"></span>
+                                            Markdown出力
+                                        </button>
+                                    </div>
+
+                                    {/* 定義・測定条件表 */}
+                                    {analysisResult.definitions.length > 0 && (
+                                        <div className="mb-8">
+                                            <h3 className="text-xl font-semibold mb-4 text-purple-600">
+                                                📋 先取り表：定義語・測定条件（明細書ベース）
+                                            </h3>
+                                            <div className="overflow-x-auto">
+                                                <table className="w-full border border-gray-300 rounded-lg overflow-hidden text-sm">
+                                                    <thead className="bg-purple-50">
+                                                        <tr>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">区分</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">用語/パラメータ</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">定義/測定条件</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">根拠箇所</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">抜粋（≤80字）</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">適用範囲</th>
+                                                            <th className="p-2 text-left font-medium">注意(★)</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {analysisResult.definitions.map((def, index) => (
+                                                            <tr key={index} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                                <td className="p-2 border-r border-gray-300 font-medium">{def.category}</td>
+                                                                <td className="p-2 border-r border-gray-300">{def.term}</td>
+                                                                <td className="p-2 border-r border-gray-300">{def.definition}</td>
+                                                                <td className="p-2 border-r border-gray-300">{def.source}</td>
+                                                                <td className="p-2 border-r border-gray-300 text-xs">{def.excerpt}</td>
+                                                                <td className="p-2 border-r border-gray-300">{def.scope}</td>
+                                                                <td className="p-2">{def.notes}</td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* クレーム対比表 */}
+                                    {analysisResult.claims.map(claim => (
+                                        <div key={claim.claimNumber} className="mb-8">
+                                            <h3 className="text-xl font-semibold mb-4 text-indigo-600">
+                                                Claim {claim.claimNumber} 対比表
+                                            </h3>
+                                            
+                                            <div className="overflow-x-auto">
+                                                <table className="w-full border border-gray-300 rounded-lg overflow-hidden text-sm">
+                                                    <thead className="bg-gray-50">
+                                                        <tr>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">要素ID</th>
+                                                            <th className="p-2 text-left border-r border-gray-300 font-medium">クレーム文</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">文献</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">有無</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">箇所</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">一致タイプ</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">抜粋（≤80字）</th>
+                                                            <th className="p-2 text-center border-r border-gray-300 font-medium">図/表</th>
+                                                            <th className="p-2 text-center font-medium">コメント</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {claim.comparisonTable.map((row, rowIndex) => (
+                                                            row.citations.map((cit, citIndex) => (
+                                                                <tr key={`${rowIndex}-${citIndex}`} className={rowIndex % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                                    {citIndex === 0 && (
+                                                                        <>
+                                                                            <td className="p-2 border-r border-gray-300 font-bold text-center" rowSpan={row.citations.length}>
+                                                                                {row.elementId}
+                                                                                {row.specialTypes.length > 0 && (
+                                                                                    <div className="mt-1">
+                                                                                        {row.specialTypes.includes('numerical') && <span className="inline-block bg-purple-100 text-purple-600 text-xs px-1 rounded mr-1">数値</span>}
+                                                                                        {row.specialTypes.includes('parameter') && <span className="inline-block bg-green-100 text-green-600 text-xs px-1 rounded mr-1">パラメータ</span>}
+                                                                                        {row.specialTypes.includes('selection') && <span className="inline-block bg-orange-100 text-orange-600 text-xs px-1 rounded">選択</span>}
+                                                                                    </div>
+                                                                                )}
+                                                                            </td>
+                                                                            <td className="p-2 border-r border-gray-300" rowSpan={row.citations.length}>
+                                                                                {row.element}
+                                                                            </td>
+                                                                        </>
+                                                                    )}
+                                                                    <td className="p-2 border-r border-gray-300 text-center font-medium">
+                                                                        {cit.citationName}
+                                                                    </td>
+                                                                    <td className="p-2 border-r border-gray-300 text-center">
+                                                                        <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-sm font-bold ${
+                                                                            cit.status === '○' ? 'bg-green-100 text-green-600' :
+                                                                            cit.status === '△' ? 'bg-yellow-100 text-yellow-600' :
+                                                                            'bg-red-100 text-red-600'
+                                                                        }`}>
+                                                                            {cit.status}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="p-2 border-r border-gray-300 text-center">
+                                                                        {cit.location}
+                                                                    </td>
+                                                                    <td className="p-2 border-r border-gray-300 text-center">
+                                                                        <div className="flex items-center justify-center gap-1">
+                                                                            <span className="text-lg">{getMatchTypeIcon(cit.matchType)}</span>
+                                                                            <span className="text-xs">{getMatchTypeLabel(cit.matchType)}</span>
+                                                                        </div>
+                                                                    </td>
+                                                                    <td className="p-2 border-r border-gray-300 text-xs">
+                                                                        {cit.excerpt || '—'}
+                                                                    </td>
+                                                                    <td className="p-2 border-r border-gray-300 text-center text-xs">
+                                                                        {cit.figureTable || '—'}
+                                                                    </td>
+                                                                    <td className="p-2">
+                                                                        <div className="flex items-center gap-1">
+                                                                            {cit.comment.includes('★') ? (
+                                                                                <span className="icon-alert text-orange-500 flex-shrink-0"></span>
+                                                                            ) : (
+                                                                                <span className="icon-check text-green-500 flex-shrink-0"></span>
+                                                                            )}
+                                                                            <span className="text-xs">{cit.comment}</span>
+                                                                        </div>
+                                                                    </td>
+                                                                </tr>
+                                                            ))
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    ))}
+
+                                    {/* 全体総評 */}
+                                    <div className="mt-8 p-4 bg-blue-50 rounded-lg">
+                                        <h4 className="font-semibold text-blue-800 mb-2">全体総評（≤100字）</h4>
+                                        <p className="text-blue-700">{analysisResult.overallAssessment}</p>
+                                    </div>
+
+                                    {/* ユーザ確認 */}
+                                    <div className="mt-8 p-4 bg-yellow-50 rounded-lg border-l-4 border-yellow-400">
+                                        <p className="text-yellow-800">
+                                            チャートについて <strong>修正・追補のご要望はありますか？</strong><br />
+                                            また <strong>応答案（補正案＋反論文）の作成をご希望ですか？</strong>
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<PatentRejectionResponseAI />, document.getElementById('root'));
+    </script>
+</body>
+</html>
